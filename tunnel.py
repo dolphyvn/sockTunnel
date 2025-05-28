@@ -10,6 +10,11 @@ import requests
 import ssl
 from urllib.parse import urlparse
 import argparse
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 class TunnelServer:
     def __init__(self, server_host="0.0.0.0", server_port=8080):
@@ -24,7 +29,7 @@ class TunnelServer:
         connection_id = str(uuid.uuid4())
         self.connections[connection_id] = websocket
         client_info = f"{websocket.remote_address[0]}:{websocket.remote_address[1]}"
-        print(f"New client connected: {connection_id} from {client_info}")
+        logger.info(f"New client connected: {connection_id} from {client_info}")
         
         try:
             async for message in websocket:
@@ -32,15 +37,15 @@ class TunnelServer:
                     data = json.loads(message)
                     await self.process_message(websocket, connection_id, data)
                 except json.JSONDecodeError as e:
-                    print(f"Invalid JSON from client {connection_id}: {e}")
+                    logger.error(f"Invalid JSON from client {connection_id}: {e}")
                     await websocket.send(json.dumps({
                         'type': 'error',
                         'message': 'Invalid JSON format'
                     }))
         except websockets.exceptions.ConnectionClosed:
-            print(f"Client disconnected: {connection_id}")
+            logger.info(f"Client disconnected: {connection_id}")
         except Exception as e:
-            print(f"Error handling client {connection_id}: {e}")
+            logger.error(f"Error handling client {connection_id}: {e}")
         finally:
             if connection_id in self.connections:
                 del self.connections[connection_id]
@@ -48,7 +53,7 @@ class TunnelServer:
                                if info.get('connection_id') == connection_id]
             for tid in tunnels_to_remove:
                 del self.tunnels[tid]
-                print(f"Cleaned up tunnel: {tid}")
+                logger.info(f"Cleaned up tunnel: {tid}")
     
     async def process_message(self, websocket, connection_id, data):
         """Process messages from tunnel clients"""
@@ -95,7 +100,7 @@ class TunnelServer:
                 'protocol': tunnel_info['protocol']
             }
             await websocket.send(json.dumps(response))
-            print(f"Created {tunnel_info['protocol']} tunnel: {tunnel_info['public_url']} -> {tunnel_info['local_host']}:{tunnel_info['local_port']}")
+            logger.info(f"Created {tunnel_info['protocol']} tunnel: {tunnel_info['public_url']} -> {tunnel_info['local_host']}:{tunnel_info['local_port']}")
     
     def start_websocket_proxy(self, tunnel_id):
         """Start WebSocket proxy for a tunnel"""
@@ -108,32 +113,33 @@ class TunnelServer:
         
         async def websocket_proxy_handler(websocket):
             """Handle incoming WebSocket connections and proxy to local service"""
-            # Get the path from the websocket (if available)
             path = getattr(websocket, 'path', '/')
             local_uri = f"ws://{tunnel_info['local_host']}:{tunnel_info['local_port']}{path}"
-            print(f"WebSocket connection: {websocket.remote_address} -> {local_uri}")
+            logger.info(f"WebSocket connection: {websocket.remote_address} -> {local_uri}")
             
             try:
                 # Connect to local WebSocket service
                 async with websockets.connect(local_uri) as local_ws:
+                    logger.info(f"Connected to local WebSocket service: {local_uri}")
+                    
                     # Start forwarding messages in both directions
                     async def forward_to_local():
                         try:
                             async for message in websocket:
                                 await local_ws.send(message)
                         except websockets.exceptions.ConnectionClosed:
-                            pass
+                            logger.info("Client WebSocket connection closed")
                         except Exception as e:
-                            print(f"Error forwarding to local: {e}")
+                            logger.error(f"Error forwarding to local: {e}")
                     
                     async def forward_to_client():
                         try:
                             async for message in local_ws:
                                 await websocket.send(message)
                         except websockets.exceptions.ConnectionClosed:
-                            pass
+                            logger.info("Local WebSocket connection closed")
                         except Exception as e:
-                            print(f"Error forwarding to client: {e}")
+                            logger.error(f"Error forwarding to client: {e}")
                     
                     # Run both forwarding tasks concurrently
                     await asyncio.gather(
@@ -142,8 +148,10 @@ class TunnelServer:
                         return_exceptions=True
                     )
             
+            except websockets.exceptions.ConnectionClosed:
+                logger.info("WebSocket proxy connection closed")
             except Exception as e:
-                print(f"WebSocket proxy error: {e}")
+                logger.error(f"WebSocket proxy error: {e}")
                 try:
                     await websocket.close(code=1011, reason="Proxy error")
                 except:
@@ -151,30 +159,55 @@ class TunnelServer:
         
         async def start_ws_server():
             try:
-                async with websockets.serve(websocket_proxy_handler, '0.0.0.0', proxy_port):
-                    tunnel_info['proxy_port'] = proxy_port
-                    # Use the server's external IP/hostname for public URL
-                    public_host = self.server_host if self.server_host != '0.0.0.0' else 'localhost'
-                    tunnel_info['public_url'] = f"ws://{public_host}:{proxy_port}"
-                    
-                    # Update client with real URL
-                    if self.loop and tunnel_info.get('websocket'):
-                        try:
-                            asyncio.run_coroutine_threadsafe(
-                                tunnel_info['websocket'].send(json.dumps({
-                                    'type': 'tunnel_updated',
-                                    'tunnel_id': tunnel_id,
-                                    'public_url': tunnel_info['public_url']
-                                })),
-                                self.loop
-                            )
-                        except Exception as e:
-                            print(f"Failed to send tunnel update: {e}")
-                    
-                    print(f"WebSocket proxy started: {tunnel_info['public_url']} -> ws://{tunnel_info['local_host']}:{tunnel_info['local_port']}")
-                    await asyncio.Future()  # Run forever
+                # Create server with proper error handling
+                server = await websockets.serve(
+                    websocket_proxy_handler, 
+                    '0.0.0.0', 
+                    proxy_port,
+                    # Add these parameters to handle connection issues better
+                    ping_interval=20,
+                    ping_timeout=10,
+                    close_timeout=10
+                )
+                
+                tunnel_info['proxy_port'] = proxy_port
+                # Use the server's external IP/hostname for public URL
+                if self.server_host != '0.0.0.0':
+                    public_host = self.server_host
+                else:
+                    # Try to get the actual IP address
+                    try:
+                        import socket
+                        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                        s.connect(("8.8.8.8", 80))
+                        public_host = s.getsockname()[0]
+                        s.close()
+                    except:
+                        public_host = 'localhost'
+                
+                tunnel_info['public_url'] = f"ws://{public_host}:{proxy_port}"
+                
+                # Update client with real URL
+                if self.loop and tunnel_info.get('websocket'):
+                    try:
+                        asyncio.run_coroutine_threadsafe(
+                            tunnel_info['websocket'].send(json.dumps({
+                                'type': 'tunnel_updated',
+                                'tunnel_id': tunnel_id,
+                                'public_url': tunnel_info['public_url']
+                            })),
+                            self.loop
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to send tunnel update: {e}")
+                
+                logger.info(f"WebSocket proxy started: {tunnel_info['public_url']} -> ws://{tunnel_info['local_host']}:{tunnel_info['local_port']}")
+                
+                # Wait for server to close
+                await server.wait_closed()
+                
             except Exception as e:
-                print(f"Failed to start WebSocket proxy: {e}")
+                logger.error(f"Failed to start WebSocket proxy: {e}")
         
         # Run the WebSocket server in a new event loop
         def run_ws_server():
@@ -183,7 +216,7 @@ class TunnelServer:
             try:
                 loop.run_until_complete(start_ws_server())
             except Exception as e:
-                print(f"WebSocket server loop error: {e}")
+                logger.error(f"WebSocket server loop error: {e}")
             finally:
                 loop.close()
         
@@ -197,7 +230,8 @@ class TunnelServer:
         
         class TunnelHTTPHandler(BaseHTTPRequestHandler):
             def log_message(self, format, *args):
-                pass
+                # Custom logging
+                logger.info(f"HTTP: {format % args}")
                 
             def do_GET(self):
                 self.proxy_request('GET')
@@ -237,14 +271,12 @@ class TunnelServer:
                     self.end_headers()
                     self.wfile.write(response.content)
                     
-                    print(f"Proxied {method} {self.path} -> {response.status_code}")
-                    
                 except requests.exceptions.ConnectionError:
                     self.send_error(502, "Bad Gateway: Could not connect to local service")
                 except requests.exceptions.Timeout:
                     self.send_error(504, "Gateway Timeout")
                 except Exception as e:
-                    print(f"Proxy error: {e}")
+                    logger.error(f"Proxy error: {e}")
                     self.send_error(502, f"Bad Gateway: {str(e)}")
         
         import random
@@ -252,8 +284,20 @@ class TunnelServer:
         try:
             server = HTTPServer(('0.0.0.0', proxy_port), TunnelHTTPHandler)
             tunnel_info['proxy_port'] = proxy_port
-            # Use the server's external IP/hostname for public URL
-            public_host = self.server_host if self.server_host != '0.0.0.0' else 'localhost'
+            
+            # Get public host
+            if self.server_host != '0.0.0.0':
+                public_host = self.server_host
+            else:
+                try:
+                    import socket
+                    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    s.connect(("8.8.8.8", 80))
+                    public_host = s.getsockname()[0]
+                    s.close()
+                except:
+                    public_host = 'localhost'
+                    
             tunnel_info['public_url'] = f"http://{public_host}:{proxy_port}"
             
             if self.loop and tunnel_info.get('websocket'):
@@ -267,12 +311,12 @@ class TunnelServer:
                         self.loop
                     )
                 except Exception as e:
-                    print(f"Failed to send tunnel update: {e}")
+                    logger.error(f"Failed to send tunnel update: {e}")
             
-            print(f"HTTP proxy started: {tunnel_info['public_url']} -> http://{tunnel_info['local_host']}:{tunnel_info['local_port']}")
+            logger.info(f"HTTP proxy started: {tunnel_info['public_url']} -> http://{tunnel_info['local_host']}:{tunnel_info['local_port']}")
             server.serve_forever()
         except Exception as e:
-            print(f"Failed to start HTTP proxy: {e}")
+            logger.error(f"Failed to start HTTP proxy: {e}")
     
     def start_tcp_proxy(self, tunnel_id):
         """Start TCP proxy for a tunnel"""
@@ -286,7 +330,7 @@ class TunnelServer:
                 local_socket.settimeout(30)
                 local_socket.connect((tunnel_info['local_host'], tunnel_info['local_port']))
                 
-                print(f"TCP connection established: {client_socket.getpeername()} -> {tunnel_info['local_host']}:{tunnel_info['local_port']}")
+                logger.info(f"TCP connection established: {client_socket.getpeername()} -> {tunnel_info['local_host']}:{tunnel_info['local_port']}")
                 
                 def forward_data(source, destination, direction):
                     try:
@@ -296,7 +340,7 @@ class TunnelServer:
                                 break
                             destination.send(data)
                     except Exception as e:
-                        print(f"TCP forward error ({direction}): {e}")
+                        logger.debug(f"TCP forward error ({direction}): {e}")
                     finally:
                         try:
                             source.close()
@@ -313,7 +357,7 @@ class TunnelServer:
                 t2.join()
                 
             except Exception as e:
-                print(f"TCP proxy error: {e}")
+                logger.error(f"TCP proxy error: {e}")
             finally:
                 try:
                     client_socket.close()
@@ -329,8 +373,20 @@ class TunnelServer:
             server_socket.listen(5)
             
             tunnel_info['proxy_port'] = proxy_port
-            # Use the server's external IP/hostname for public URL
-            public_host = self.server_host if self.server_host != '0.0.0.0' else 'localhost'
+            
+            # Get public host
+            if self.server_host != '0.0.0.0':
+                public_host = self.server_host
+            else:
+                try:
+                    import socket
+                    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    s.connect(("8.8.8.8", 80))
+                    public_host = s.getsockname()[0]
+                    s.close()
+                except:
+                    public_host = 'localhost'
+                    
             tunnel_info['public_url'] = f"tcp://{public_host}:{proxy_port}"
             
             if self.loop and tunnel_info.get('websocket'):
@@ -344,9 +400,9 @@ class TunnelServer:
                         self.loop
                     )
                 except Exception as e:
-                    print(f"Failed to send tunnel update: {e}")
+                    logger.error(f"Failed to send tunnel update: {e}")
             
-            print(f"TCP proxy started: {tunnel_info['public_url']} -> {tunnel_info['local_host']}:{tunnel_info['local_port']}")
+            logger.info(f"TCP proxy started: {tunnel_info['public_url']} -> {tunnel_info['local_host']}:{tunnel_info['local_port']}")
             
             while True:
                 try:
@@ -357,19 +413,30 @@ class TunnelServer:
                         daemon=True
                     ).start()
                 except Exception as e:
-                    print(f"TCP server error: {e}")
+                    logger.error(f"TCP server error: {e}")
                     break
         except Exception as e:
-            print(f"Failed to start TCP proxy: {e}")
+            logger.error(f"Failed to start TCP proxy: {e}")
     
     async def start_server(self):
         """Start the tunnel server"""
-        print(f"Starting tunnel server on {self.server_host}:{self.server_port}")
+        logger.info(f"Starting tunnel server on {self.server_host}:{self.server_port}")
         self.loop = asyncio.get_running_loop()
         
         try:
-            async with websockets.serve(self.handle_client, self.server_host, self.server_port):
-                print(f"Tunnel server is running on {self.server_host}:{self.server_port}")
+            # Create server with better error handling
+            async with websockets.serve(
+                self.handle_client, 
+                self.server_host, 
+                self.server_port,
+                # Add connection parameters
+                ping_interval=20,
+                ping_timeout=10,
+                close_timeout=10,
+                # Handle invalid WebSocket requests gracefully
+                process_request=self.process_request
+            ):
+                logger.info(f"Tunnel server is running on {self.server_host}:{self.server_port}")
                 print("Clients can connect using:")
                 if self.server_host == '0.0.0.0':
                     print(f"  ws://YOUR_SERVER_IP:{self.server_port}")
@@ -378,9 +445,29 @@ class TunnelServer:
                 print("Press Ctrl+C to stop.")
                 await asyncio.Future()
         except KeyboardInterrupt:
-            print("\nShutting down tunnel server...")
+            logger.info("Shutting down tunnel server...")
         except Exception as e:
-            print(f"Server error: {e}")
+            logger.error(f"Server error: {e}")
+    
+    def process_request(self, connection, request):
+        """Handle non-WebSocket requests gracefully"""
+        # Check if this is a proper WebSocket request
+        if request.headers.get("connection", "").lower() != "upgrade":
+            # This is an HTTP request, not WebSocket
+            logger.warning(f"HTTP request to WebSocket endpoint from {connection.remote_address}: {request.method} {request.path}")
+            
+            # Return a simple HTTP response
+            response = (
+                "HTTP/1.1 400 Bad Request\r\n"
+                "Content-Type: text/plain\r\n"
+                "Content-Length: 54\r\n"
+                "\r\n"
+                "This is a WebSocket endpoint, not HTTP. Use ws:// URL."
+            )
+            return response.encode(), []
+        
+        # Let websockets handle the WebSocket upgrade
+        return None
 
 
 class TunnelClient:
@@ -392,12 +479,16 @@ class TunnelClient:
     async def connect(self):
         """Connect to tunnel server"""
         try:
-            print(f"Connecting to tunnel server: {self.server_url}")
-            self.websocket = await websockets.connect(self.server_url)
-            print(f"✓ Connected to tunnel server successfully!")
+            logger.info(f"Connecting to tunnel server: {self.server_url}")
+            self.websocket = await websockets.connect(
+                self.server_url,
+                ping_interval=20,
+                ping_timeout=10
+            )
+            logger.info("✓ Connected to tunnel server successfully!")
             return True
         except Exception as e:
-            print(f"✗ Failed to connect to tunnel server: {e}")
+            logger.error(f"✗ Failed to connect to tunnel server: {e}")
             print(f"Make sure the server is running on {self.server_url}")
             return False
     
@@ -409,11 +500,11 @@ class TunnelClient:
                     data = json.loads(message)
                     await self.handle_message(data)
                 except json.JSONDecodeError as e:
-                    print(f"Invalid JSON from server: {e}")
+                    logger.error(f"Invalid JSON from server: {e}")
         except websockets.exceptions.ConnectionClosed:
-            print("Connection to server closed")
+            logger.info("Connection to server closed")
         except Exception as e:
-            print(f"Error receiving messages: {e}")
+            logger.error(f"Error receiving messages: {e}")
     
     async def handle_message(self, data):
         """Handle messages from server"""
@@ -434,7 +525,7 @@ class TunnelClient:
     async def create_tunnel(self, protocol, local_port, local_host="localhost"):
         """Create a new tunnel"""
         if not self.websocket:
-            print("Not connected to server")
+            logger.error("Not connected to server")
             return False
             
         message = {
@@ -446,10 +537,10 @@ class TunnelClient:
         
         try:
             await self.websocket.send(json.dumps(message))
-            print(f"Requesting {protocol} tunnel for {local_host}:{local_port}...")
+            logger.info(f"Requesting {protocol} tunnel for {local_host}:{local_port}...")
             return True
         except Exception as e:
-            print(f"Failed to create tunnel: {e}")
+            logger.error(f"Failed to create tunnel: {e}")
             return False
 
 
@@ -480,8 +571,12 @@ def main():
     parser.add_argument('--server-url', help='Tunnel server URL for client (e.g., ws://server.com:8080)')
     parser.add_argument('--server-host', default='0.0.0.0', help='Server bind host (server mode)')
     parser.add_argument('--server-port', type=int, default=8080, help='Server bind port (server mode)')
+    parser.add_argument('--debug', action='store_true', help='Enable debug logging')
     
     args = parser.parse_args()
+    
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
     
     try:
         if args.mode == 'server':
@@ -510,7 +605,7 @@ def main():
     except KeyboardInterrupt:
         print("\nGoodbye!")
     except Exception as e:
-        print(f"Error: {e}")
+        logger.error(f"Error: {e}")
 
 
 if __name__ == "__main__":
