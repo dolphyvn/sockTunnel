@@ -1,6 +1,6 @@
 import asyncio
 import websockets
-from websockets import Response
+from websockets.http import Response
 import socket
 import threading
 import json
@@ -428,15 +428,15 @@ class TunnelServer:
                 # This is an HTTP request, not WebSocket
                 logger.warning(f"HTTP request to WebSocket endpoint from {connection.remote_address}: {request.path}")
                 
-                # Return a proper Response object
+                # Return a proper Response object with correct parameters
                 response_body = "This is a WebSocket endpoint, not HTTP. Use ws:// URL."
                 return Response(
-                    status=400,
-                    headers={
-                        "Content-Type": "text/plain",
-                        "Content-Length": str(len(response_body))
-                    },
-                    body=response_body
+                    400,  # status code
+                    [
+                        ("Content-Type", "text/plain"),
+                        ("Content-Length", str(len(response_body)))
+                    ],  # headers as list of tuples
+                    response_body.encode()  # body as bytes
                 )
             
             # Let websockets handle the WebSocket upgrade
@@ -446,12 +446,12 @@ class TunnelServer:
             # Return a generic error response
             response_body = "Server Error"
             return Response(
-                status=500,
-                headers={
-                    "Content-Type": "text/plain",  
-                    "Content-Length": str(len(response_body))
-                },
-                body=response_body
+                500,  # status code
+                [
+                    ("Content-Type", "text/plain"),
+                    ("Content-Length", str(len(response_body)))
+                ],  # headers as list of tuples
+                response_body.encode()  # body as bytes
             )
     
     async def start_server(self):
