@@ -418,6 +418,41 @@ class TunnelServer:
         except Exception as e:
             logger.error(f"Failed to start TCP proxy: {e}")
     
+    def process_request(self, connection, request):
+        """Handle non-WebSocket requests gracefully"""
+        try:
+            # Check if this is a proper WebSocket request
+            connection_header = request.headers.get("connection", "").lower()
+            if "upgrade" not in connection_header:
+                # This is an HTTP request, not WebSocket
+                logger.warning(f"HTTP request to WebSocket endpoint from {connection.remote_address}: {request.path}")
+                
+                # Return a simple HTTP response
+                response_body = "This is a WebSocket endpoint, not HTTP. Use ws:// URL."
+                response = (
+                    f"HTTP/1.1 400 Bad Request\r\n"
+                    f"Content-Type: text/plain\r\n"
+                    f"Content-Length: {len(response_body)}\r\n"
+                    f"\r\n"
+                    f"{response_body}"
+                )
+                return response.encode(), []
+            
+            # Let websockets handle the WebSocket upgrade
+            return None
+        except Exception as e:
+            logger.error(f"Error in process_request: {e}")
+            # Return a generic error response
+            response_body = "Server Error"
+            response = (
+                f"HTTP/1.1 500 Internal Server Error\r\n"
+                f"Content-Type: text/plain\r\n"
+                f"Content-Length: {len(response_body)}\r\n"
+                f"\r\n"
+                f"{response_body}"
+            )
+            return response.encode(), []
+    
     async def start_server(self):
         """Start the tunnel server"""
         logger.info(f"Starting tunnel server on {self.server_host}:{self.server_port}")
@@ -448,26 +483,6 @@ class TunnelServer:
             logger.info("Shutting down tunnel server...")
         except Exception as e:
             logger.error(f"Server error: {e}")
-    
-    def process_request(self, connection, request):
-        """Handle non-WebSocket requests gracefully"""
-        # Check if this is a proper WebSocket request
-        if request.headers.get("connection", "").lower() != "upgrade":
-            # This is an HTTP request, not WebSocket
-            logger.warning(f"HTTP request to WebSocket endpoint from {connection.remote_address}: {request.method} {request.path}")
-            
-            # Return a simple HTTP response
-            response = (
-                "HTTP/1.1 400 Bad Request\r\n"
-                "Content-Type: text/plain\r\n"
-                "Content-Length: 54\r\n"
-                "\r\n"
-                "This is a WebSocket endpoint, not HTTP. Use ws:// URL."
-            )
-            return response.encode(), []
-        
-        # Let websockets handle the WebSocket upgrade
-        return None
 
 
 class TunnelClient:
