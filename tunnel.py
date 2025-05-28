@@ -68,7 +68,8 @@ class TunnelServer:
                 'local_port': data.get('local_port'),
                 'local_host': data.get('local_host', 'localhost'),
                 'client_websocket': websocket,
-                'client_ip': websocket.remote_address[0]
+                'client_ip': websocket.remote_address[0],
+                'public_url': 'pending'  # Will be updated when proxy starts
             }
             
             self.tunnels[tunnel_id] = tunnel_info
@@ -96,7 +97,8 @@ class TunnelServer:
             response = {
                 'type': 'tunnel_created',
                 'tunnel_id': tunnel_id,
-                'protocol': tunnel_info['protocol']
+                'protocol': tunnel_info['protocol'],
+                'public_url': tunnel_info['public_url']  # Added this back
             }
             await websocket.send(json.dumps(response))
             logger.info(f"Created {tunnel_info['protocol']} tunnel: {tunnel_id} -> {tunnel_info['client_ip']}:{tunnel_info['local_port']}")
@@ -167,10 +169,13 @@ class TunnelServer:
                             logger.error(f"Failed to send request to client: {e}")
                     
                     # Send the request
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    loop.run_until_complete(send_request())
-                    loop.close()
+                    def run_async():
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                        loop.run_until_complete(send_request())
+                        loop.close()
+                    
+                    threading.Thread(target=run_async, daemon=True).start()
                     
                     # Wait for response
                     try:
@@ -188,7 +193,10 @@ class TunnelServer:
                             body = body.encode('utf-8')
                         self.wfile.write(body)
                         
+                        logger.info(f"Successfully proxied {method} {self.path} -> {response_data.get('status_code')}")
+                        
                     except queue.Empty:
+                        logger.error(f"Timeout waiting for response from client")
                         self.send_error(504, "Gateway Timeout")
                     finally:
                         if request_id in tunnel_info['pending_requests']:
@@ -219,6 +227,7 @@ class TunnelServer:
                     
             tunnel_info['public_url'] = f"http://{public_host}:{proxy_port}"
             
+            # Send updated URL to client
             if self.loop and tunnel_info.get('client_websocket'):
                 try:
                     asyncio.run_coroutine_threadsafe(
@@ -304,6 +313,8 @@ class TunnelClient:
                     await self.handle_message(data)
                 except json.JSONDecodeError as e:
                     logger.error(f"Invalid JSON from server: {e}")
+                except Exception as e:
+                    logger.error(f"Error handling message: {e}")
         except websockets.exceptions.ConnectionClosed:
             logger.info("Connection to server closed")
         except Exception as e:
@@ -317,6 +328,8 @@ class TunnelClient:
             print(f"✓ Tunnel created successfully!")
             print(f"  Protocol: {data['protocol']}")
             print(f"  Tunnel ID: {data['tunnel_id']}")
+            if 'public_url' in data:
+                print(f"  Public URL: {data['public_url']}")
         
         elif msg_type == 'tunnel_updated':
             print(f"✓ Tunnel URL updated: {data['public_url']}")
@@ -346,6 +359,8 @@ class TunnelClient:
             for k, v in headers.items():
                 if k.lower() not in ['host', 'connection']:
                     clean_headers[k] = v
+            
+            logger.info(f"Forwarding {method} {path} to {local_url}")
             
             response = requests.request(
                 method=method,
