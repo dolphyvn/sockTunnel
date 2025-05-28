@@ -1,5 +1,6 @@
 import asyncio
 import websockets
+from websockets import Response
 import socket
 import threading
 import json
@@ -427,16 +428,16 @@ class TunnelServer:
                 # This is an HTTP request, not WebSocket
                 logger.warning(f"HTTP request to WebSocket endpoint from {connection.remote_address}: {request.path}")
                 
-                # Return a simple HTTP response
+                # Return a proper Response object
                 response_body = "This is a WebSocket endpoint, not HTTP. Use ws:// URL."
-                response = (
-                    f"HTTP/1.1 400 Bad Request\r\n"
-                    f"Content-Type: text/plain\r\n"
-                    f"Content-Length: {len(response_body)}\r\n"
-                    f"\r\n"
-                    f"{response_body}"
+                return Response(
+                    status=400,
+                    headers={
+                        "Content-Type": "text/plain",
+                        "Content-Length": str(len(response_body))
+                    },
+                    body=response_body
                 )
-                return response.encode(), []
             
             # Let websockets handle the WebSocket upgrade
             return None
@@ -444,14 +445,14 @@ class TunnelServer:
             logger.error(f"Error in process_request: {e}")
             # Return a generic error response
             response_body = "Server Error"
-            response = (
-                f"HTTP/1.1 500 Internal Server Error\r\n"
-                f"Content-Type: text/plain\r\n"
-                f"Content-Length: {len(response_body)}\r\n"
-                f"\r\n"
-                f"{response_body}"
+            return Response(
+                status=500,
+                headers={
+                    "Content-Type": "text/plain",  
+                    "Content-Length": str(len(response_body))
+                },
+                body=response_body
             )
-            return response.encode(), []
     
     async def start_server(self):
         """Start the tunnel server"""
