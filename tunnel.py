@@ -1,6 +1,5 @@
 import asyncio
 import websockets
-from websockets.http import Response
 import socket
 import threading
 import json
@@ -419,48 +418,13 @@ class TunnelServer:
         except Exception as e:
             logger.error(f"Failed to start TCP proxy: {e}")
     
-    def process_request(self, connection, request):
-        """Handle non-WebSocket requests gracefully"""
-        try:
-            # Check if this is a proper WebSocket request
-            connection_header = request.headers.get("connection", "").lower()
-            if "upgrade" not in connection_header:
-                # This is an HTTP request, not WebSocket
-                logger.warning(f"HTTP request to WebSocket endpoint from {connection.remote_address}: {request.path}")
-                
-                # Return a proper Response object with correct parameters
-                response_body = "This is a WebSocket endpoint, not HTTP. Use ws:// URL."
-                return Response(
-                    400,  # status code
-                    [
-                        ("Content-Type", "text/plain"),
-                        ("Content-Length", str(len(response_body)))
-                    ],  # headers as list of tuples
-                    response_body.encode()  # body as bytes
-                )
-            
-            # Let websockets handle the WebSocket upgrade
-            return None
-        except Exception as e:
-            logger.error(f"Error in process_request: {e}")
-            # Return a generic error response
-            response_body = "Server Error"
-            return Response(
-                500,  # status code
-                [
-                    ("Content-Type", "text/plain"),
-                    ("Content-Length", str(len(response_body)))
-                ],  # headers as list of tuples
-                response_body.encode()  # body as bytes
-            )
-    
     async def start_server(self):
         """Start the tunnel server"""
         logger.info(f"Starting tunnel server on {self.server_host}:{self.server_port}")
         self.loop = asyncio.get_running_loop()
         
         try:
-            # Create server with better error handling
+            # Create server without custom process_request to avoid HTTP handling issues
             async with websockets.serve(
                 self.handle_client, 
                 self.server_host, 
@@ -468,9 +432,7 @@ class TunnelServer:
                 # Add connection parameters
                 ping_interval=20,
                 ping_timeout=10,
-                close_timeout=10,
-                # Handle invalid WebSocket requests gracefully
-                process_request=self.process_request
+                close_timeout=10
             ):
                 logger.info(f"Tunnel server is running on {self.server_host}:{self.server_port}")
                 print("Clients can connect using:")
@@ -479,6 +441,7 @@ class TunnelServer:
                 else:
                     print(f"  ws://{self.server_host}:{self.server_port}")
                 print("Press Ctrl+C to stop.")
+                print("Note: HTTP requests to this WebSocket endpoint will show connection errors - this is normal.")
                 await asyncio.Future()
         except KeyboardInterrupt:
             logger.info("Shutting down tunnel server...")
